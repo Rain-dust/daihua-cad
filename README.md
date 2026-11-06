@@ -76,7 +76,7 @@ Skills 是给 Agent 的工作说明和知识资料；MCP 提供调用 CAD 的工
 
 最后一条生成并审计一个离线 DXF 示例，结果放在 `output/`。安装检查通过代表配置和依赖检查通过，不代表所有 CAD 操作或图纸质量已通过验证。
 
-首版实测与限制见[验证记录](docs/VALIDATION.md)。
+实测与限制见[验证记录](docs/VALIDATION.md)；再次审查发现与修复的问题见[审查记录](docs/REVIEW.md)。
 
 ## 配置位置
 

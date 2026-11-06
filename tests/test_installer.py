@@ -288,5 +288,148 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.repo / ".venv").exists())
 
 
+    def test_shared_bundle_update_syncs_owners_and_retires_removed_files(self):
+        self.assertEqual(self.run_cli()[0], 0)
+        cursor = self.root / "cursor.json"
+        self.assertEqual(self.run_cli(client="cursor", config=cursor)[0], 0)
+        (self.repo / "skills/cad-automation/SKILL.md").write_text("new bundle", encoding="utf-8")
+        (self.repo / "skills/cad-designer/references/guide.txt").unlink()
+        self.assertEqual(self.run_cli()[0], 0)
+        self.assertFalse((self.skills / "cad-designer/references/guide.txt").exists())
+        result, output = self.run_cli(client="cursor", config=cursor)
+        self.assertEqual(result, 0, output)
+        self.assertEqual(self.run_cli("--uninstall")[0], 0)
+        self.assertEqual((self.skills / "cad-automation/SKILL.md").read_text(encoding="utf-8"), "new bundle")
+        self.assertEqual(self.run_cli("--uninstall", client="cursor", config=cursor)[0], 0)
+        self.assertFalse((self.skills / "cad-automation").exists())
+        self.assertFalse((self.skills / "cad-designer").exists())
+
+    def test_shared_bundle_update_allows_reverse_uninstall_and_keeps_user_edits(self):
+        self.assertEqual(self.run_cli()[0], 0)
+        cursor = self.root / "cursor.json"
+        self.assertEqual(self.run_cli(client="cursor", config=cursor)[0], 0)
+        target = self.skills / "cad-automation/SKILL.md"
+        target.write_text("user edit", encoding="utf-8")
+        before = self.snapshot()
+        self.assertEqual(self.run_cli(client="cursor", config=cursor)[0], 1)
+        self.assertEqual(self.snapshot(), before)
+        target.write_bytes((self.repo / "skills/cad-automation/SKILL.md").read_bytes())
+        (self.repo / "skills/cad-automation/SKILL.md").write_text("new bundle", encoding="utf-8")
+        self.assertEqual(self.run_cli()[0], 0)
+        self.assertEqual(self.run_cli("--uninstall", client="cursor", config=cursor)[0], 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "new bundle")
+        self.assertEqual(self.run_cli("--uninstall")[0], 0)
+        self.assertFalse(target.exists())
+
+    def test_shared_update_repairs_legacy_stale_owner_hashes(self):
+        self.assertEqual(self.run_cli()[0], 0)
+        cursor = self.root / "cursor.json"
+        self.assertEqual(self.run_cli(client="cursor", config=cursor)[0], 0)
+        previous = json.loads(installer.STATE.read_text(encoding="utf-8"))
+        (self.repo / "skills/cad-automation/SKILL.md").write_text("new bundle", encoding="utf-8")
+        (self.repo / "skills/cad-designer/references/guide.txt").write_text("updated guide", encoding="utf-8")
+        self.assertEqual(self.run_cli()[0], 0)
+        state = json.loads(installer.STATE.read_text(encoding="utf-8"))
+        for key, record in state["installs"].items():
+            if record["client"] == "cursor":
+                record["files"] = previous["installs"][key]["files"]
+        installer.STATE.write_text(json.dumps(state), encoding="utf-8")
+        (self.repo / "skills/cad-designer/references/guide.txt").unlink()
+        result, output = self.run_cli(client="cursor", config=cursor)
+        self.assertEqual(result, 0, output)
+        self.assertFalse((self.skills / "cad-designer/references/guide.txt").exists())
+        self.assertEqual(self.run_cli()[0], 0)
+        self.assertEqual(self.run_cli("--uninstall")[0], 0)
+        self.assertEqual(self.run_cli("--uninstall", client="cursor", config=cursor)[0], 0)
+        self.assertFalse((self.skills / "cad-automation").exists())
+
+    def fail_one_write(self, destination):
+        original = installer.write_file
+        failed = False
+
+        def write(path, data, backup=False):
+            nonlocal failed
+            if path == destination and not failed:
+                failed = True
+                raise PermissionError("simulated file in use")
+            return original(path, data, backup=backup)
+
+        return patch.object(installer, "write_file", side_effect=write)
+
+    def test_first_install_failure_restores_configuration_and_allows_retry(self):
+        self.write_config('model = "keep"\n')
+        original = self.config.read_bytes()
+        with self.fail_one_write(self.skills / "cad-designer/SKILL.md"):
+            result, output = self.run_cli()
+        self.assertEqual(result, 1, output)
+        self.assertIn("were restored", output)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse(installer.STATE.exists())
+        self.assertFalse(any(self.skills.rglob("SKILL.md")))
+        self.assertFalse(any(self.root.rglob("*.daihua-tmp-*")))
+        result, output = self.run_cli()
+        self.assertEqual(result, 0, output)
+
+    def test_update_failure_restores_skills_retired_files_and_manifest(self):
+        self.assertEqual(self.run_cli()[0], 0)
+        original = self.snapshot()
+        (self.repo / "skills/cad-automation/SKILL.md").write_text("new bundle", encoding="utf-8")
+        (self.repo / "skills/cad-designer/references/guide.txt").unlink()
+        with self.fail_one_write(installer.STATE):
+            result, output = self.run_cli()
+        self.assertEqual(result, 1, output)
+        self.assertIn("were restored", output)
+        for relative, content in original.items():
+            path = self.root / relative
+            if self.skills in path.parents or path in (self.config, installer.STATE):
+                self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(self.run_cli()[0], 0)
+
+    def test_uninstall_failure_restores_configuration_skills_and_manifest(self):
+        self.assertEqual(self.run_cli()[0], 0)
+        original = self.snapshot()
+        with self.fail_one_write(installer.STATE):
+            result, output = self.run_cli("--uninstall")
+        self.assertEqual(result, 1, output)
+        self.assertIn("were restored", output)
+        for relative, content in original.items():
+            self.assertEqual((self.root / relative).read_bytes(), content)
+        self.assertEqual(self.run_cli("--uninstall")[0], 0)
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behavior")
+    def test_replaced_skill_junction_never_writes_or_deletes_external_files(self):
+        import _winapi
+
+        self.assertEqual(self.run_cli()[0], 0)
+        reference = self.skills / "cad-automation/references"
+        external = self.root / "external"
+        reference.rename(external)
+        _winapi.CreateJunction(str(external), str(reference))
+        self.assertFalse(reference.is_symlink())
+        (self.repo / "skills/cad-automation/references/guide.txt").write_text("new bundle", encoding="utf-8")
+        result, output = self.run_cli()
+        self.assertEqual(result, 1, output)
+        self.assertIn("reparse point", output)
+        protected = external / "guide.txt"
+        self.assertEqual(protected.read_text(encoding="utf-8"), "original guide\n")
+        self.assertEqual(self.run_cli("--uninstall")[0], 0)
+        self.assertEqual(protected.read_text(encoding="utf-8"), "original guide\n")
+        self.assertTrue(reference.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behavior")
+    def test_bundled_skill_root_junction_is_rejected_without_writes(self):
+        import _winapi
+
+        bundled = self.repo / "skills/cad-automation"
+        external = self.root / "external"
+        bundled.rename(external)
+        _winapi.CreateJunction(str(external), str(bundled))
+        result, output = self.run_cli()
+        self.assertEqual(result, 1, output)
+        self.assertIn("reparse point", output)
+        self.assertFalse(self.config.exists())
+        self.assertFalse(installer.STATE.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

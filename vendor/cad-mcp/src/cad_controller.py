@@ -206,6 +206,7 @@ class CADController:
         """初始化CAD控制器"""
         self.app = None
         self.doc = None
+        self._target_lost = False  # never silently rebind a lost session to another open drawing
         self.entities = {}  # 存储已创建图形的实体引用，用于后续修改
         # 专用COM线程执行器：所有COM调用经由它串行执行
         self.executor = COMExecutor()
@@ -215,7 +216,7 @@ class CADController:
         # 获取CAD类型
         self.cad_type = config["cad"]["type"]
         # 有效的线宽值列表
-        self.valid_lineweights = [0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200, 211]
+        self.valid_lineweights = [-3, -2, -1, 0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140, 158, 200, 211]
         logger.info("CAD控制器已初始化")
 
     def _get_app_info(self) -> Tuple[List[str], str]:
@@ -234,8 +235,11 @@ class CADController:
         }
         return app_map.get(self.cad_type.lower(), (["AutoCAD.Application"], "AutoCAD"))
 
-    def start_cad(self) -> bool:
-        """启动CAD并创建或打开一个文档"""
+    def start_cad(self, for_document_selection: bool = False) -> bool:
+        """Attach once; explicit new/open may connect without adopting a document."""
+        if getattr(self, "_target_lost", False) and not for_document_selection:
+            logger.error("会话目标图纸已失效，请先显式新建或打开图纸")
+            return False
         # 存储旧实例引用（如果有）以便后续清理
         old_app = None
         if self.app is not None:
@@ -274,6 +278,13 @@ class CADController:
                 # 等待CAD启动
                 time.sleep(self.startup_wait_time)  # 使用配置的等待时间
 
+            if for_document_selection:
+                # new/open must select their requested document successfully before
+                # tools can write. A failed request must not adopt an unrelated tab.
+                self.doc = None
+                self._target_lost = True
+                return True
+
             # 第三步：获取或创建文档（集合与属性访问都可能被忙碌的CAD拒绝，逐调用重试）
             docs = self._call(getattr, self.app, "Documents")
             if self._call(getattr, docs, "Count") == 0:
@@ -305,6 +316,7 @@ class CADController:
                 logger.error(f"无法读取文档名称: {str(name_ex)}")
                 raise Exception("文档对象无效")
 
+            self._target_lost = False
             logger.info("CAD已成功启动和准备")
             return True
 
@@ -383,12 +395,9 @@ class CADController:
             return _call_with_com_retry(fn, args, kwargs)
         except Exception as e:
             # CAD进程已被用户关闭时，持有的COM引用全部失效（重试无意义）：
-            # 重置连接状态，让下一次操作走 is_running()==False 分支自动重连，
-            # 否则所有工具会持续报"操作失败"且永远不会触发重启
-            if getattr(e, "hresult", None) in _DEAD_COM_HRESULTS:
-                logger.warning("检测到CAD进程已退出，重置连接状态（下一次操作将重新启动CAD）")
-                self.app = None
-                self.doc = None
+            # Mark the target lost; explicit new/open can reconnect without
+            # silently adopting another user drawing.
+            self._invalidate_dead_connection(e)
             raise
 
     def _call_attr(self, obj, name: str, *args, **kwargs):
@@ -400,8 +409,37 @@ class CADController:
         _call之前。本方法将查找与调用合并为一个重试单元，
         并把pywin32转换后的"查找被拒"AttributeError也纳入瞬态重试。
         """
-        return _call_with_com_retry(lambda: getattr(obj, name)(*args, **kwargs),
-                                    (), {}, retry_attr=name)
+        try:
+            return _call_with_com_retry(lambda: getattr(obj, name)(*args, **kwargs),
+                                        (), {}, retry_attr=name)
+        except Exception as e:
+            self._invalidate_dead_connection(e)
+            raise
+
+    def _invalidate_dead_connection(self, error) -> None:
+        if getattr(error, "hresult", None) in _DEAD_COM_HRESULTS:
+            logger.warning("CAD连接已失效；请显式新建或打开图纸以重新选择目标")
+            self.app = None
+            self.doc = None
+            self._target_lost = True
+
+    def _activate_target_document(self) -> None:
+        """Keep window/application commands on the same pinned document as geometry."""
+        if not self.is_running():
+            raise RuntimeError("会话目标图纸不可用，请显式新建或打开图纸")
+        self._call_attr(self.doc, "Activate")
+
+    def get_current_layer_name(self) -> str:
+        """Read the pinned document, including layer changes made in the CAD UI."""
+        return str(self._call(getattr, self._call(getattr, self.doc, "ActiveLayer"), "Name"))
+
+    def _discard_created(self, entity) -> None:
+        """Clean up only an entity created by the failed operation."""
+        if entity is not None:
+            try:
+                self._call_attr(entity, "Delete")
+            except Exception as e:
+                logger.warning("无法清理本次操作创建的实体: %s", e)
 
     def _ms(self):
         """获取模型空间（属性读取同样可能被忙碌的CAD拒绝，需带重试）"""
@@ -469,6 +507,13 @@ class CADController:
             # 其工作目录与MCP服务器的工作目录通常不同（实测相对文件会存到别处）
             file_path = os.path.abspath(file_path)
 
+            # SaveAs does not select a format from the filename extension.
+            # Autodesk AcSaveAsType: ac2018_dwg=64, ac2018_dxf=65.
+            extension = os.path.splitext(file_path)[1].lower()
+            file_type = {".dwg": 64, ".dxf": 65}.get(extension)
+            if file_type is None:
+                raise ValueError("仅支持 .dwg 或 .dxf 保存路径（2018 文件格式）")
+
             # 确保目录存在（abspath后必有dirname；目录可能尚未创建）
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
@@ -477,7 +522,7 @@ class CADController:
 
             # 保存文件（SaveAs返回后CAD仍可能短暂拒绝后续修改调用，
             # 后续工具的COM调用会经由调用级重试自动等待恢复）
-            self._call_attr(self.doc, "SaveAs", file_path)
+            self._call_attr(self.doc, "SaveAs", file_path, file_type)
             logger.info(f"图纸已保存到: {file_path}")
 
             return True
@@ -513,7 +558,7 @@ class CADController:
             有效的线宽值
         """
         if lineweight is None:
-            return None
+            return -1  # acLnWtByLayer, independent of the user's CELWEIGHT
 
         # 检查线宽是否在有效值列表中
         if lineweight in self.valid_lineweights:
@@ -535,17 +580,15 @@ class CADController:
             # 设置实体的图层（使用CAD返回的真实图层名，避免传入名称大小写不匹配）
             self._call(setattr, entity, "Layer", self._call(getattr, target_layer, "Name"))
 
-        # 如果指定了颜色，设置颜色
-        if color is not None:
-            self._call(self._write_color, entity, color)
-
-        if lineweight is not None:
-            lw = self.validate_lineweight(lineweight)
-            # gen_py包装下属性名为Lineweight（与LineWeight的写法差异同Color/color）
-            try:
-                self._call(setattr, entity, "Lineweight", lw)
-            except AttributeError:
-                self._call(setattr, entity, "LineWeight", lw)
+        # Explicit defaults prevent CECOLOR/CELTYPE/CELWEIGHT leaking into deliveries.
+        self._call(self._write_color, entity, 256 if color is None else color)
+        self._call(setattr, entity, "Linetype", "ByLayer")
+        lw = self.validate_lineweight(lineweight)
+        # gen_py包装下属性名为Lineweight（与LineWeight的写法差异同Color/color）
+        try:
+            self._call(setattr, entity, "Lineweight", lw)
+        except AttributeError:
+            self._call(setattr, entity, "LineWeight", lw)
 
     def draw_line(self, start_point: Tuple[float, float, float],
                  end_point: Tuple[float, float, float], layer: str = None, color: int = None, lineweight=None) -> Any:
@@ -553,6 +596,7 @@ class CADController:
         if not self.is_running():
             return None
 
+        line = None
         try:
             # 使用VARIANT包装坐标点数据（_pt自动补齐Z轴）
             start_array = self._pt(start_point)
@@ -569,6 +613,7 @@ class CADController:
             return line
 
         except Exception as e:
+            self._discard_created(line)
             logger.error(f"绘制直线时出错: {str(e)}")
             return None
 
@@ -583,6 +628,7 @@ class CADController:
             logger.error(f"绘制圆失败: 半径({radius})必须为正数")
             return None
 
+        circle = None
         try:
             # 使用VARIANT包装坐标点数据（_pt自动补齐Z轴）
             center_array = self._pt(center)
@@ -598,6 +644,7 @@ class CADController:
             return circle
 
         except Exception as e:
+            self._discard_created(circle)
             logger.error(f"绘制圆时出错: {str(e)}")
             return None
 
@@ -612,6 +659,7 @@ class CADController:
             logger.error(f"绘制圆弧失败: 半径({radius})必须为正数")
             return None
 
+        arc = None
         try:
             # 将角度转换为弧度
             start_rad = math.radians(start_angle)
@@ -630,6 +678,7 @@ class CADController:
             logger.debug(f"已绘制圆弧: 中心{center}, 半径{radius}, 起始角度{start_angle}, 结束角度{end_angle}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
             return arc
         except Exception as e:
+            self._discard_created(arc)
             logger.error(f"绘制圆弧失败: {str(e)}")
             return None
 
@@ -646,6 +695,7 @@ class CADController:
             logger.error(f"绘制椭圆失败: 长轴({major_axis})必须为正且不小于短轴({minor_axis})")
             return None
 
+        ellipse = None
         try:
             if rotation is None:
                 rotation = 0
@@ -672,6 +722,7 @@ class CADController:
             logger.debug(f"已绘制椭圆: 中心{center}, 长轴{major_axis}, 短轴{minor_axis}, 旋转角度{rotation}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
             return ellipse
         except Exception as e:
+            self._discard_created(ellipse)
             logger.error(f"绘制椭圆失败: {str(e)}")
             return None
 
@@ -680,6 +731,7 @@ class CADController:
         if not self.is_running():
             return None
 
+        polyline = None
         try:
             # 确保所有点都是三维的
             processed_points = []
@@ -707,6 +759,7 @@ class CADController:
             logger.debug(f"已绘制多段线: {len(points)}个点, {'闭合' if closed else '不闭合'}, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
             return polyline
         except Exception as e:
+            self._discard_created(polyline)
             logger.error(f"绘制多段线时出错: {str(e)}")
             return None
 
@@ -748,6 +801,7 @@ class CADController:
         if not self.is_running():
             return None
 
+        text_obj = None
         try:
             # 使用VARIANT包装坐标点数据（_pt自动补齐Z轴）
             position_array = self._pt(position)
@@ -766,6 +820,7 @@ class CADController:
             logger.debug(f"已添加文本: '{text}', 位置{position}, 高度{height}, 旋转{rotation}度, 图层{layer if layer else '默认'}, 颜色{color if color is not None else '默认'}")
             return text_obj
         except Exception as e:
+            self._discard_created(text_obj)
             logger.error(f"添加文本时出错: {str(e)}")
             return None
 
@@ -787,6 +842,7 @@ class CADController:
             return None
 
         closed_polyline = None
+        hatch = None
         try:
             # 确保所有点都是有效的
             if not points or len(points) < 3:
@@ -822,11 +878,8 @@ class CADController:
         except Exception as e:
             # 失败时清理已创建的边界多段线，避免在图纸上留下孤儿实体
             # （调用方看到的是"失败"，图纸上却不应多出一条闭合多段线）
-            if closed_polyline is not None:
-                try:
-                    self._call_attr(closed_polyline, "Delete")
-                except Exception:
-                    pass
+            self._discard_created(hatch)
+            self._discard_created(closed_polyline)
             logger.error(f"创建填充时出错: {str(e)}")
             return None
 
@@ -837,6 +890,7 @@ class CADController:
 
         try:
             # ZoomExtents 是 Application 对象的方法（非 ActiveViewport）
+            self._activate_target_document()
             self._call_attr(self.app, "ZoomExtents")
             logger.info("已缩放视图以显示所有对象")
             return True
@@ -918,6 +972,7 @@ class CADController:
             if not self.is_running():
                 return None
 
+            dimension = None
             try:
                 # 如果未提供文本位置，自动计算
                 if text_position is None:
@@ -945,6 +1000,7 @@ class CADController:
                 logger.info(f"已添加标注: 从 {start_point} 到 {end_point}, 图层{layer if layer else '默认'}")
                 return dimension
             except Exception as e:
+                self._discard_created(dimension)
                 logger.error(f"添加标注时出错: {str(e)}")
                 return None
 
@@ -1118,6 +1174,7 @@ class CADController:
         if not self.is_running():
             raise RuntimeError("CAD未运行")
 
+        self._activate_target_document()
         import win32gui
         import win32con
         from PIL import ImageGrab
@@ -1225,6 +1282,7 @@ class CADController:
         """复制实体并平移指定位移，返回新实体"""
         if not self.is_running():
             return None
+        copy = None
         try:
             entity = self._get_entity_by_handle(handle)
             # 复制+平移打包为一个撤销组（Copy与Move分开重试，均幂等安全）
@@ -1234,6 +1292,7 @@ class CADController:
                     self._call_attr(copy, "Move", self._pt((0, 0, 0)), self._pt(displacement))
             return copy
         except Exception as e:
+            self._discard_created(copy)
             logger.error(f"复制实体失败: {str(e)}")
             return None
 
@@ -1268,19 +1327,21 @@ class CADController:
         """矩形阵列：沿位移向量方向复制 count-1 份（含原实体共 count 个）"""
         if not self.is_running():
             return []
+        copies = []
         try:
             src = self._get_entity_by_handle(handle)
             dx, dy = float(displacement[0]), float(displacement[1])
             dz = float(displacement[2]) if len(displacement) > 2 else 0.0
-            copies = []
             # 整个阵列打包为一个撤销组；循环内逐调用重试避免部分完成后重复
             with self._undo_group():
                 for i in range(1, count):
                     copy = self._call_attr(src, "Copy")
-                    self._call_attr(copy, "Move", self._pt((0, 0, 0)), self._pt((dx * i, dy * i, dz * i)))
                     copies.append(copy)
+                    self._call_attr(copy, "Move", self._pt((0, 0, 0)), self._pt((dx * i, dy * i, dz * i)))
             return copies
         except Exception as e:
+            for created in copies:
+                self._discard_created(created)
             logger.error(f"线性阵列失败: {str(e)}")
             return []
 
@@ -1288,31 +1349,34 @@ class CADController:
         """环形阵列：绕中心点在 total_angle 角度范围内复制 count-1 份"""
         if not self.is_running():
             return []
+        copies = []
         try:
             src = self._get_entity_by_handle(handle)
             step = math.radians(total_angle_degrees / count)
             center_pt = self._pt(center)
-            copies = []
             # 整个阵列打包为一个撤销组；循环内逐调用重试避免部分完成后重复
             with self._undo_group():
                 for i in range(1, count):
                     copy = self._call_attr(src, "Copy")
-                    self._call_attr(copy, "Rotate", center_pt, step * i)
                     copies.append(copy)
+                    self._call_attr(copy, "Rotate", center_pt, step * i)
             return copies
         except Exception as e:
+            for created in copies:
+                self._discard_created(created)
             logger.error(f"环形阵列失败: {str(e)}")
             return []
 
     def undo(self) -> bool:
-        """撤销上一步操作"""
+        """提交撤销上一步操作的命令；需回读图纸验证执行结果。"""
         if not self.is_running():
             return False
         try:
             # 注意：实测 AutoCAD 上 "_.UNDO 1" 带前缀+数字参数的组合不生效，
             # 纯英文命令名 "UNDO 1" 可靠（中文版CAD原生支持英文命令名）
+            self._activate_target_document()
             self._call_attr(self.doc, "SendCommand", "UNDO 1\n")
-            # SendCommand是异步的：等待命令处理完再返回，确保后续调用能看到撤销结果
+            # A short delay only throttles submissions; it does not prove completion.
             time.sleep(self.command_delay)
             return True
         except Exception as e:
@@ -1320,12 +1384,13 @@ class CADController:
             return False
 
     def redo(self) -> bool:
-        """重做被撤销的操作"""
+        """提交重做命令；需回读图纸验证执行结果。"""
         if not self.is_running():
             return False
         try:
+            self._activate_target_document()
             self._call_attr(self.doc, "SendCommand", "_.REDO\n")
-            # SendCommand是异步的：等待命令处理完再返回
+            # A short delay only throttles submissions; it does not prove completion.
             time.sleep(self.command_delay)
             return True
         except Exception as e:
@@ -1364,6 +1429,7 @@ class CADController:
             # Documents集合的获取与Add调用都可能被忙碌的CAD拒绝，逐调用重试
             docs = self._call(getattr, self.app, "Documents")
             self.doc = self._call_attr(docs, "Add")
+            self._target_lost = False
             # Name读取可能被刚创建文档的CAD短暂拒绝，需带重试（否则日志误显示None）
             logger.info(f"已新建文档: {self._call(getattr, self.doc, 'Name')}")
             return self.doc is not None
@@ -1386,6 +1452,7 @@ class CADController:
             opened = self._call_attr(docs, "Open", file_path)
             # 部分CAD的Documents.Open不返回文档对象，回退到取活动文档
             self.doc = opened if opened is not None else self._call(getattr, self.app, "ActiveDocument")
+            self._target_lost = False
             logger.info(f"已打开文档: {file_path}")
             return True
         except Exception as e:
@@ -1399,11 +1466,9 @@ class CADController:
         try:
             # 关闭期间CAD忙碌会拒绝调用，调用级重试确保Close本身成功
             self._call_attr(self.doc, "Close", save)
-            # 尝试切换到其他已打开的文档
-            try:
-                self.doc = self._call(getattr, self.app, "ActiveDocument")
-            except Exception:
-                self.doc = None
+            # Closing ends this session target. Never adopt another user drawing.
+            self.doc = None
+            self._target_lost = True
             logger.info(f"已关闭当前文档（保存: {save}）")
             return True
         except Exception as e:
@@ -1439,6 +1504,7 @@ class CADController:
         """在模型空间插入图块引用"""
         if not self.is_running():
             return None
+        block_ref = None
         try:
             # 独立撤销组，忙碌时在调用级自动重试
             with self._undo_group():
@@ -1447,8 +1513,10 @@ class CADController:
                     self._pt(position), name, x_scale, y_scale, z_scale,
                     math.radians(rotation_degrees)
                 )
+                self._apply_style(block_ref)
             return block_ref
         except Exception as e:
+            self._discard_created(block_ref)
             logger.error(f"插入图块失败: {str(e)}")
             return None
 
@@ -1471,6 +1539,7 @@ class CADController:
                     })
         except Exception as e:
             logger.error(f"列出图块失败: {str(e)}")
+            raise  # a partial/empty enumeration must not become MCP success=True
         return blocks
 
     # ==================== 命令直通 ====================
@@ -1483,13 +1552,14 @@ class CADController:
         if not self.is_running():
             return False
         try:
+            self._activate_target_document()
             # 若命令未以回车/空格结尾则补一个回车，确保命令被提交执行
             if not command.endswith(("\n", "\r", " ")):
                 command += "\n"
             # SendCommand本身可能被忙碌的CAD拒绝，调用级重试确保命令入队
             self._call_attr(self.doc, "SendCommand", command)
-            # SendCommand是异步的：等待命令执行（如ZOOM/保存类命令执行中，
-            # 后续的SaveAs等操作会报错），时长由配置command_delay控制
+            # SendCommand can be asynchronous. This configured delay only throttles
+            # submissions; callers must query the drawing to verify completion.
             time.sleep(self.command_delay)
             return True
         except Exception as e:

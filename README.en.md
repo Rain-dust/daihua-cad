@@ -88,3 +88,5 @@ Override destinations with `--config` and `--skills-dir`. Installation stops on 
 Project integration code is distributed under MIT. Vendored CAD-MCP comes from [daobataotie/CAD-MCP](https://github.com/daobataotie/CAD-MCP) and retains its upstream license. Existing skills retain their source and author information. Daihua provides packaging, portability work, and installation; it does not claim the upstream MCP or skills as wholly original work.
 
 Read [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before redistribution. Third-party CAD applications, Python dependencies, and referenced projects remain subject to their own terms.
+
+The v0.1.3 [review report](docs/REVIEW.md) records reproduced issues, fixes, native AutoCAD checks, and remaining test boundaries.

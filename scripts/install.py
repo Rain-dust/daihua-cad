@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
+import tempfile
 import subprocess
 import sys
 import tomllib
@@ -134,10 +136,57 @@ def write_file(path, data, backup=False):
         snapshot = path.with_name(path.name + ".daihua-backup-" + stamp)
         shutil.copy2(path, snapshot)
         print(f"Backup: {snapshot}")
-    temporary = path.with_name(path.name + ".daihua-tmp")
-    temporary.write_bytes(encoded)
-    temporary.replace(path)
+    descriptor, filename = tempfile.mkstemp(prefix=path.name + ".daihua-tmp-", dir=path.parent)
+    temporary = Path(filename)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return True
+
+
+def apply_file_changes(changes):
+    """Restore the prior files if a multi-file install or uninstall fails."""
+    snapshots = {}
+    missing_directories = set()
+    attempted = []
+    try:
+        for path, _, _ in changes:
+            if path not in snapshots:
+                snapshots[path] = path.read_bytes() if path.exists() else None
+            parent = path.parent
+            while not parent.exists():
+                missing_directories.add(parent)
+                parent = parent.parent
+        for path, data, backup in changes:
+            attempted.append(path)
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                write_file(path, data, backup=backup)
+    except OSError as exc:
+        failures = []
+        for path in dict.fromkeys(reversed(attempted)):
+            original = snapshots[path]
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                elif not path.exists() or path.read_bytes() != original:
+                    write_file(path, original)
+            except OSError as rollback_exc:
+                failures.append(f"{path}: {rollback_exc}")
+        for directory in sorted(missing_directories, key=lambda item: len(item.parts), reverse=True):
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as rollback_exc:
+                failures.append(f"{directory}: {rollback_exc}")
+        if failures:
+            raise InstallError(f"File update failed: {exc}. Some files could not be restored: {'; '.join(failures)}. Keep the repository and configuration backups for recovery.") from exc
+        raise InstallError(f"File update failed: {exc}. Previous configuration, skills, and ownership manifest were restored; fix the error and rerun the installer.") from exc
 
 
 def python_path():
@@ -149,10 +198,21 @@ def desired_entry():
     return {"command": str(python_path()), "args": ["-u", str(ROOT / "vendor" / "cad-mcp" / "src" / "server.py"), "--transport", "stdio"], "cwd": str(ROOT)}
 
 
+def is_link_or_reparse(path):
+    # Path.is_symlink() excludes Windows junctions on Python 3.11.
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
 def source_files():
     result = {}
     for name in SKILLS:
         directory = ROOT / "skills" / name
+        if not safe_skill_path(directory, ROOT):
+            raise InstallError(f"Bundled skill contains an unsupported symbolic link or reparse point: {directory}")
         if not (directory / "SKILL.md").is_file():
             raise InstallError(f"Missing bundled skill: {directory / 'SKILL.md'}. Clone or download the complete repository.")
         files = {}
@@ -160,8 +220,8 @@ def source_files():
             relative = source.relative_to(directory)
             if any(part in ("__pycache__", ".git") for part in relative.parts) or source.suffix == ".pyc":
                 continue
-            if source.is_symlink():
-                raise InstallError(f"Bundled skill contains an unsupported symbolic link: {source}")
+            if is_link_or_reparse(source):
+                raise InstallError(f"Bundled skill contains an unsupported symbolic link or reparse point: {source}")
             if source.is_file():
                 files[str(relative)] = source
         result[name] = files
@@ -184,7 +244,7 @@ def safe_skill_path(path, skills):
         return False
     current = path
     while current != skills:
-        if current.is_symlink():
+        if is_link_or_reparse(current):
             return False
         current = current.parent
     return True
@@ -196,24 +256,26 @@ def preflight_skills(sources, skills, previous, state, key):
     others = all_owned_files(state, key)
     if skills is None:
         return files
+    if skills.exists() and not skills.is_dir():
+        raise InstallError(f"Skill destination root is not a directory: {skills}")
     for name, bundle in sources.items():
         target = skills / name
         owned_directory = any(Path(p).parent == target or target in Path(p).parents for p in list(previous_files) + list(others))
         if target.exists() and not owned_directory:
             raise InstallError(f"Skill directory already exists and is not managed by Daihua CAD: {target}. Choose --skills-dir with an empty destination or move the existing skill yourself.")
-        if target.is_symlink():
-            raise InstallError(f"Refusing to write through a skill-directory symbolic link: {target}")
+        if is_link_or_reparse(target):
+            raise InstallError(f"Refusing to write through a skill-directory symbolic link or reparse point: {target}")
         for relative, source in bundle.items():
             destination = target / relative
             expected = digest_bytes(source.read_bytes())
             if not safe_skill_path(destination, skills):
-                raise InstallError(f"Refusing a skill destination through a symbolic link: {destination}")
+                raise InstallError(f"Refusing a skill destination through a symbolic link or reparse point: {destination}")
             if destination.exists():
-                if not destination.is_file() or destination.is_symlink():
+                if not destination.is_file() or is_link_or_reparse(destination):
                     raise InstallError(f"Skill destination is not a regular file: {destination}")
                 existing = digest_bytes(destination.read_bytes())
-                owned_hash = previous_files.get(str(destination), others.get(str(destination)))
-                if owned_hash is None or existing != owned_hash:
+                owned_hashes = {record.get("files", {}).get(str(destination)) for record in state["installs"].values()}
+                if existing not in owned_hashes:
                     raise InstallError(f"Skill has local changes or is unmanaged: {destination}. Keep your changes and select another --skills-dir.")
             files[str(destination)] = expected
     return files
@@ -268,14 +330,14 @@ def uninstall(args, config, skills, state, key):
     if args.dry_run:
         print(f"Dry run: would remove {len(removable)} unchanged skill files and " + ("the unchanged MCP entry." if new_content is not None else "no MCP entry."))
         return 0
-    if new_content is not None:
-        write_file(config, new_content, backup=True)
+    changes = [(config, new_content, True)] if new_content is not None else []
+    changes.extend((path, None, False) for path in removable)
+    state["installs"].pop(key)
+    changes.append((STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n", False))
+    apply_file_changes(changes)
     for path in removable:
-        path.unlink()
         if skills:
             prune_empty(path.parent, skills)
-    state["installs"].pop(key)
-    write_file(STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
     print("Uninstalled managed configuration and unchanged skill files. Repository and .venv were retained.")
     return 0
 
@@ -358,21 +420,34 @@ def main(argv=None):
             return 0
         if not args.skip_deps:
             dependencies()
-        write_file(config, rendered, backup=True)
+        changes = [(config, rendered, True)]
         if skills:
             for name, bundle in sources.items():
                 for relative, source in bundle.items():
-                    write_file(skills / name / relative, source.read_bytes())
-        # Retire files removed by an updated bundle only when they remain unchanged.
-        for value, expected in (previous or {}).get("files", {}).items():
-            if value not in files and value not in all_owned_files(state, key):
-                path = Path(value)
-                if skills and safe_skill_path(path, skills) and path.is_file() and digest_bytes(path.read_bytes()) == expected:
-                    path.unlink()
-                    if skills:
-                        prune_empty(path.parent, skills)
+                    changes.append((skills / name / relative, source.read_bytes(), False))
+        # A shared directory has one physical bundle. Keep every owning client
+        # in sync so another client's update/uninstall sees the current hashes.
+        old_files = {value: {expected} for value, expected in (previous or {}).get("files", {}).items()}
+        if skills:
+            for record in state["installs"].values():
+                if record.get("skills_dir") == str(skills):
+                    for value, expected in record.get("files", {}).items():
+                        old_files.setdefault(value, set()).add(expected)
+                    record["files"] = dict(files)
         state["installs"][key] = {"client": args.client, "config": str(config), "skills_dir": str(skills) if skills else None, "entry_hash": digest_entry(entry), "files": files}
-        write_file(STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n")
+        # Retire files removed by an updated bundle only when they remain unchanged.
+        retired = []
+        other_files = all_owned_files(state, key)
+        for value, expected_hashes in old_files.items():
+            if value not in files and value not in other_files:
+                path = Path(value)
+                if skills and safe_skill_path(path, skills) and path.is_file() and digest_bytes(path.read_bytes()) in expected_hashes:
+                    changes.append((path, None, False))
+                    retired.append(path)
+        changes.append((STATE, json.dumps(state, ensure_ascii=False, indent=2) + "\n", False))
+        apply_file_changes(changes)
+        for path in retired:
+            prune_empty(path.parent, skills)
         if args.skip_deps:
             print("Dependencies skipped: this configuration will work only after .venv and requirements-runtime.txt are installed.")
         print("Daihua CAD configured. Restart or reload your agent client, then ask it to connect to your local CAD application.")

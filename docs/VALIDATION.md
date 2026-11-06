@@ -15,3 +15,7 @@
 - 修正 Windows 短路径与完整路径的测试比较；MCP 验证控制台输出采用 ASCII JSON，UTF-8 报告文件保留中文。
 - 直接 Python 安装入口对宿主编码无法表示的字符作转义容错；新增 cp1252 子进程回归，验证中文和 emoji 路径的 dry-run 不写入文件。
 - 本地测试增至 25 项并全部通过；Windows/Linux 与 Python 3.11/3.12 的自动检查见 GitHub Actions。
+
+## v0.1.3 再次审查
+
+56 项回归、MCP 35 工具协议检查及 AutoCAD 2026 独立测试图保存/回读验证通过。具体问题、修正与验证边界见 [审查记录](REVIEW.md)。

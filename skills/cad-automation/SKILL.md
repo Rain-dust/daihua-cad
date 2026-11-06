@@ -4,7 +4,7 @@ description: 使用 CAD MCP、Python COM、AutoLISP 或离线 DXF 创建和编�
 license: MIT
 metadata:
   category: engineering-cad
-  version: 1.2.1
+  version: 1.2.2
   author: Delancy
   integration-maintainer: Rain-dust
 ---
@@ -29,7 +29,7 @@ metadata:
 | 国产 CAD 兼容 | COM + 英文命令 + DXF | 中望/浩辰对 COM 和 DXF 兼容度通常较高 | AutoLISP |
 
 ### 执行铁律
-1. 先判断环境：`AutoCAD.Application` 能连接则走 COM，不能连接则走离线 DXF。
+1. 优先使用已配置的 MCP；直接 COM 时检测本机实际 CAD 与 ProgID。连接不可用时，只有任务允许 DXF 才转离线路线；必须交付 DWG 时先处理连接或说明交付障碍，不能把 DXF 改扩展名代替。
 2. 先确认项目单位、坐标系和比例，模型按实际单位 1:1 绘制；机械示例可采用毫米，既有图纸不得静默换单位。图纸空间处理视口和出图比例。
 3. 按项目建立图层、核对 WCS/UCS 并清理本任务创建的选择集。整理图形优先使用无交互 API（如 `PurgeAll()`）；审计、缩放和重生成按当前 CAD 版本及任务需要执行，不盲目串接会等待输入的命令。
 4. 输出前至少做 L3 验证：对象数量、关键图层、关键几何尺寸、文字/标注存在性。
@@ -43,7 +43,7 @@ metadata:
 
 ### 可编辑 DWG 分层交付硬约束
 
-交付可编辑 DWG 时必须阅读并执行 [可编辑 DWG 分层交付验收](references/editable-dwg-delivery.md)。按实际构件和用途分层，实体外观 ByLayer；不得把整张 PDF/图片、导入碎线或整图单一块充当可编辑 CAD。规则铺装用原生 HATCH，尺寸用 DIMENSION，组件用分类 INSERT；原始底图混层也需整理。保存后逐张回读 DWG，清点“图层 × 实体类型”，抽查关闭/隔离及编辑更新。AUDIT 0 错误或 PDF 外观正确不能替代这些检查；不合格先修正再交付。
+交付可编辑 DWG 时必须阅读并执行 [可编辑 DWG 分层交付验收](references/editable-dwg-delivery.md)。按实际构件和用途分层，实体外观 ByLayer；不得把整张 PDF/图片、导入碎线或整图单一块充当可编辑 CAD。规则铺装用原生 HATCH，尺寸用 DIMENSION，组件用分类 INSERT；整理范围服从任务：新建或明确要求整图整理时处理所用底图，局部修改保留无关底图与既有标准。保存后逐张回读 DWG，清点“图层 × 实体类型”，抽查关闭/隔离及编辑更新。AUDIT 0 错误或 PDF 外观正确不能替代这些检查；不合格先修正再交付。
 
 ### 交付前文案检查
 
@@ -384,29 +384,23 @@ xref = acad.model.AttachExternalReference(
 
 ## 七、选择集与过滤
 
+以下示例只删除自身新建的选择集。`doc` 是当前任务已明确选定的文档；读取全部实体不授权修改全部实体。
+
 ```python
-# 创建选择集
-ss = acad.doc.SelectionSets.Add("SS1")
+import uuid
 
-# 全选
-ss.Select(5)  # acSelectionSetAll
-
-# 窗口选择
-ss.Select(0, APoint(0,0,0), APoint(100,100,0))  # acSelectionSetWindow
-
-# 过滤选择 (所有圆,半径>10)
-import win32com.client
-ft = win32com.client.VARIANT(0, [0, "CIRCLE", 40, 10.0])  # DXF组码过滤
-fd = win32com.client.VARIANT(0, [0, ">="])
-ss.Select(5, 0, 0, ft, fd)
-
-# 遍历选择集
-for obj in ss:
-    print(f"对象类型: {obj.ObjectName}, 图层: {obj.Layer}")
-
-# 删除选择集
-ss.Delete()
+ss = doc.SelectionSets.Add("DAIHUA_" + uuid.uuid4().hex)
+try:
+    ss.Select(5)  # acSelectionSetAll；也可按任务使用窗口选择
+    circles = [obj for obj in ss
+               if obj.ObjectName == "AcDbCircle" and obj.Radius > 10]
+    for obj in circles:
+        print(f"圆半径: {obj.Radius}, 图层: {obj.Layer}")
+finally:
+    ss.Delete()  # 只清理本函数创建的选择集
 ```
+
+需要原生 DXF 过滤器时，FilterType 与 FilterData 必须是匹配的组码数组和值数组，关系运算符用 -4 组码；按本机 COM 库构造相应 SAFEARRAY，不使用混合组码/值的 `VARIANT(0, ...)`。
 
 ### DXF组码常用过滤
 
@@ -656,32 +650,11 @@ batch_process_dwgs(drawings_folder)  # 项目指定的图纸目录
 
 ### 11.2 文件格式转换
 
-```python
-import os
+批量转换先固定经授权的输入清单与输出目录，逐个打开并保存到新的目标路径；拒绝静默覆盖。优先使用 `Documents.Open()` 与当前 CAD 版本支持的 `SaveAs()` 格式枚举，转换后用实际文件回读核对单位、布局及关键实体，再关闭本任务打开的文档。
 
-def convert_dwg_to_dxf(folder):
-    """批量DWG→DXF"""
-    for f in os.listdir(folder):
-        if f.endswith('.dwg'):
-            path = os.path.join(folder, f)
-            out = path.replace('.dwg', '.dxf')
-            acad.doc.SendCommand(f'_OPEN "{path}"\n')
-            time.sleep(1)
-            acad.doc.SendCommand(f'_SAVEAS DXF 2018 "{out}"\n')
-            time.sleep(0.5)
-            acad.doc.SendCommand('_CLOSE\n')
+若必须使用命令，先验证该版本完整的保存/导出应答流程、确认目标文档，并等待命令真正完成；不能用固定 `sleep` 后发送 `_CLOSE` 作为完成判据。未完成或失败时保留诊断现场，不保存/关闭无关文档。
 
-# 支持的导出格式
-formats = {
-    '.dxf': 'DXF',     # 交换格式
-    '.dwt': 'DWT',     # 模板
-    '.pdf': 'PDF',     # 文档
-    '.dwf': 'DWF',     # 轻量浏览
-    '.stl': 'STL',     # 3D打印
-    '.iges': 'IGS',    # 通用三维
-    '.step': 'STP',    # 通用三维
-}
-```
+DXF、DWT、PDF、DWF、STL、STEP 等格式的导入/导出支持取决于 CAD 产品、版本、模块和转换器；逐项检查实际能力，不将改扩展名视为格式转换。
 
 ### 11.3 运行脚本
 
@@ -884,45 +857,22 @@ ss.Delete()
 
 ---
 
-### 铁律 0：启动即清理——关闭孤儿文档 + 清理选择集 🔴
+### 铁律 0：先确定任务文档与操作范围
 
-**SW对应**: solidworks-automation Sec 24 铁律0 (CloseDoc 启动清理)
+启动时连接或新建当前任务的文档，记录文档对象与输出路径。`Drawing*.dwg`、空模型空间或窗口标题均不能证明文档可丢弃；不要自动关闭文档、清空现有图形或清理他人的选择集。
 
-**CAD病灶**: 反复调试运行时，AutoCAD 同样会积累未保存的 Drawing*.dwg，且 COM 选择集(SelectionSets)使用后不 Delete() 会累积导致后续操作报错。
+COM 选择集只清理本任务创建的对象，推荐唯一名称与 `try/finally`（见下一节）。AutoLISP 的选择集引用在使用后设为 `nil` 即可；`ssget "_X"` 每次重新选择数据库中的实体，不是枚举遗留选择集，不能用 `while (ssget "_X")` 清理。
 
-```python
-# ═══════ CAD启动首行代码 ═══════
-import win32com.client
-acad = win32com.client.Dispatch("AutoCAD.Application")
-
-# 1. 清理所有孤儿选择集
-for ss in acad.ActiveDocument.SelectionSets:
-    try:
-        ss.Delete()
-    except:
-        pass
-
-# 2. 如果当前文档为空(Drawing1.dwg)，新建正式文档
-doc = acad.ActiveDocument
-if doc.Name.startswith("Drawing") and doc.ModelSpace.Count == 0:
-    # 用模板新建
-    doc.New("acadiso.dwt")
-```
-
-**LISP 等效**:
 ```lisp
-;; 启动清理
-(defun startup_clean ()
-  ;; 清除所有选择集
-  (while (setq ss (ssget "_X"))
-    (setq ss nil))
-  ;; 确保在模型空间
-  (setvar "TILEMODE" 1)
+;; ss 是本函数创建并使用的选择集；结束时释放引用
+(defun task_selection_example (/ ss)
+  (setq ss (ssget "_X"))
+  ;; 在明确的任务范围内读取或处理 ss；空图时 ss 为 nil
+  (if ss (princ (sslength ss)))
+  (setq ss nil)
   (princ)
 )
 ```
-
----
 
 ### 铁律 1：选择集用完必 Delete——CAD 的"GetBodies2 防假跑" 🔴
 
@@ -931,42 +881,18 @@ if doc.Name.startswith("Drawing") and doc.ModelSpace.Count == 0:
 **CAD病灶**: `SelectionSets.Add("SS1")` 使用后不 Delete，再次运行同名选择集会报 "已存在" → 程序中断。
 
 ```python
-# ✅ 安全选择集模式（用完即删）
-def safe_select(acad, filter_type=None):
-    ss_name = "TEMP_SS"
-    # 删除已存在的同名选择集
+import uuid
+
+def task_entities(doc):
+    ss = doc.SelectionSets.Add("DAIHUA_" + uuid.uuid4().hex)
     try:
-        acad.ActiveDocument.SelectionSets(ss_name).Delete()
-    except:
-        pass
-    ss = acad.ActiveDocument.SelectionSets.Add(ss_name)
-    ss.Select(5)  # 全选
-    result = list(ss)
-    ss.Delete()  # ← 铁律：用完必删
-    return result
+        ss.Select(5)  # 只读取已明确选定文档中的实体
+        return list(ss)
+    finally:
+        ss.Delete()
 ```
 
-**验证机制——CAD 等效于 GetBodies2**:
-```python
-def verify_drawing(acad, expected_objects: int = None):
-    """验证图纸状态——CAD 的 GetBodies2 等效"""
-    model = acad.ActiveDocument.ModelSpace
-    count = model.Count
-
-    doc = acad.ActiveDocument
-    doc.SendCommand("_AUDIT Y\n")  # 审计修复
-    doc.SendCommand("_PURGE A * N\n")  # 清理垃圾
-
-    # 计算实体数（不含选择集内的辅助对象）
-    ss = safe_select(acad)
-    obj_count = len(ss)
-
-    return {
-        "object_count": obj_count,
-        "model_count": count,
-        "passed": expected_objects is None or obj_count >= expected_objects
-    }
-```
+实体总数仅用于发现明显遗漏。根据任务检查对象类型、语义图层、关键尺寸、单位及布局；保存后回读并应用独立于生成结果的验收断言。不要因数量超过阈值或没有异常就返回 `passed=True`，也不要在只读核验中执行修复或 PURGE。
 
 ---
 
@@ -980,112 +906,37 @@ def verify_drawing(acad, expected_objects: int = None):
 | **Tier 2** | SendCommand / SCR 脚本 | 复杂编辑（TRIM/FILLET/CHAMFER） | 异步执行、错误处理弱 |
 | **Tier 3** | AutoLISP / C# .NET | 插件开发、性能敏感、批量 | LISP 调试困难；C# 需 AutoCAD .NET SDK |
 
-**降级逻辑**:
-```python
-def try_execute(operation, *args):
-    """CAD 三级降级执行"""
-    # Tier 1: pyautocad
-    try:
-        return operation(*args)
-    except:
-        pass
-    # Tier 2: SendCommand
-    try:
-        cmd = build_sendcommand(operation, *args)
-        acad.doc.SendCommand(cmd)
-        return True
-    except:
-        pass
-    # Tier 3: 加载 LISP 脚本
-    try:
-        acad.doc.SendCommand(f'(load "fallback.lsp")\n')
-        acad.doc.SendCommand(f'FALLBACK\n')
-        return True
-    except:
-        return False
-```
+**降级逻辑**：先记录当前失败点及实际已产生的对象。只有确认上一条操作未生效，或已在任务副本中回滚，才换路线重试；不能在部分成功后盲目重发导致重复实体。`SendCommand` 接收成功和加载 LISP 成功均不是绘图完成证明，需等待命令结束并核验结果。保留原始错误，不用裸 `except` 将失败变成 `True`。
 
 ---
 
-### 铁律 3：CAD 六大隐藏地雷 ⚡
+### 铁律 3：坐标、捕捉与命令完成状态
 
-**SW对应**: Sec 21.2 五大 Interop DLL 地雷
-
-| # | 地雷 | 现象 | 正确做法 |
-|:---:|------|------|------|
-| 1 | 选择集不 Delete | "选择集已存在" 错误 | 用完立即 `ss.Delete()` |
-| 2 | SendCommand 编码 | 中文命令乱码/无效 | 用英文命令+下划线前缀 `_LINE` |
-| 3 | UCS 混淆 | 坐标与实际位置不符 | `SendCommand("_UCS _W\n")` 先切到世界坐标系 |
-| 4 | 对象捕捉干扰 | SendCommand 点选位置错误 | `SendCommand("_NON\n")` 临时关闭对象捕捉 |
-| 5 | LISP `command` 与 `vl-cmdf` | command 受 UNDO 影响 | 批量操作用 `vl-cmdf` |
-| 6 | pyautocad APoint 缺失 | 类型错误 | 所有坐标必须 `APoint(x,y,z)` 包装 |
+- API 使用 WCS/UCS 的约定按具体接口核对；任务使用局部 UCS 时保留其意图，需要临时切换时保存并恢复。不要对每条命令强制 `_UCS _W`。
+- `_NON` 是命令内部针对下一点的对象捕捉覆盖，不是可在空闲命令行单独执行的全程开关。需要在整个任务片段中禁用捕捉时保存 `OSMODE`，按位加入 16384，并在结束或异常时恢复原值。
+- `SendCommand` 在等待输入等情形下会异步返回；固定 `sleep` 不能证明命令已经完成。使用当前版本可用的命令完成事件、活动命令状态与有限超时，确认空闲后再发送下一条；超时后停止并诊断。
+- COM 坐标参数按使用的库构造双精度数组（例如 pyautocad 的 `APoint`）；不要把 pywin32 的 VARIANT 与其他 COM 封装混用。
 
 ```python
-# 地雷3-4 的防护模板
-def safe_sendcommand(acad, cmd):
-    """发送命令前先重置 UCS + 关闭对象捕捉"""
-    # 固定世界坐标系
-    acad.doc.SendCommand("_UCS _W\n")
-    # 临时关闭对象捕捉（避免吸附到错误位置）
-    acad.doc.SendCommand("_NON\n")
-    time.sleep(0.05)
-    acad.doc.SendCommand(cmd)
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_running_osnap(doc):
+    original = int(doc.GetVariable("OSMODE"))
+    try:
+        doc.SetVariable("OSMODE", original | 16384)
+        yield  # 在此执行已验证、可等待完成的任务操作
+    finally:
+        doc.SetVariable("OSMODE", original)
 ```
 
----
+### 铁律 4：审计与整理按需执行，验收依靠实际结果
 
-### 铁律 4：执行后强制审计——CAD 的 ForceRebuild3 🔴
+保存前核对关键几何、图层、标注与打印布局，并在保存后回读。`AUDIT` 用于数据库检查；修复选项会修改图纸，应在任务文档或副本中按需要执行。清理未引用资源可优先使用 `doc.PurgeAll()`，但客户模板中的未使用图层/样式可能需要保留，不把 PURGE 当作每次绘图或只读核验的前置步骤。
 
-**SW对应**: ForceRebuild3 + GetBodies2 双重验证
+`PURGE` 会显示对话框，命令行版本为 `-PURGE`；不要向 `_PURGE` 后直接串接命令行应答。若需执行交互命令，核对本机完整应答、超时和完成状态。AUDIT 的零错误及工具返回 success 均不能代替保存后的工程验收。
 
-```python
-def verify_and_audit(acad):
-    """CAD 执行后验证——等效于 SW 的 ForceRebuild3"""
-    doc = acad.ActiveDocument
-
-    # 1. 审计
-    doc.SendCommand("_AUDIT Y\n")
-    time.sleep(0.2)
-
-    # 2. 清理（去除垃圾对象）
-    doc.SendCommand("_PURGE A * N\n")
-    time.sleep(0.2)
-
-    # 3. 缩放范围（检查视觉完整性）
-    doc.SendCommand("_ZOOM _E\n")
-    time.sleep(0.2)
-
-    # 4. 重生成（刷新显示）
-    doc.SendCommand("_REGENALL\n")
-
-    return True
-```
-
----
-
-### 铁律 5：编码与坐标系——SendCommand 两条前置命令 🔴
-
-**每次 SendCommand 前强制执行的固定管线**:
-
-```python
-def sendcommand_pipeline(acad, *commands):
-    """SendCommand 安全管线——两条前置 + N条主命令"""
-    # === 前置1: 锁定WCS ===
-    acad.doc.SendCommand("_UCS _W\n")
-    time.sleep(0.05)
-
-    # === 前置2: 关闭对象捕捉 ===
-    acad.doc.SendCommand("_NON\n")
-    time.sleep(0.05)
-
-    # === 主命令 ===
-    for cmd in commands:
-        acad.doc.SendCommand(cmd)
-        time.sleep(0.1)
-
-    # === 后置: 重生成 ===
-    acad.doc.SendCommand("_REGENALL\n")
-```
+官方依据：[ssget](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-AutoLISP-Reference/files/GUID-0F37CC5E-1559-4011-B8CF-A3BA0973B2C3.htm)、[对象捕捉覆盖](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-Core/files/GUID-76B81C1A-373E-4BCD-975A-789FB36C89FE.htm)、[OSMODE](https://help.autodesk.com/cloudhelp/2026/CHS/AutoCAD-Core/files/GUID-DD9B3216-A533-4D47-95D8-7585F738FD75.htm)、[PURGE](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-Core/files/GUID-D68BA47B-A79D-4F58-9715-0569CC24BCEF.htm)、[SendCommand](https://help.autodesk.com/cloudhelp/2026/ENU/AutoCAD-ActiveX-Reference/files/GUID-E13A580D-04CA-46C1-B807-95BB461A0A57.htm)。
 
 ---
 

@@ -142,6 +142,9 @@ SERVER_INSTRUCTIONS = """CAD MCP 服务器：通过 MCP 工具控制 Windows 上
 - 首次调用工具时若 CAD 未运行会自动启动（可能需要约20秒），期间会有进度提示
 - 绘图/编辑工具返回 entity_handles（实体句柄），可用于后续编辑与查询
 - 颜色参数支持 ACI 索引(1-256)或中英文颜色名称，不指定则保持随层(ByLayer)
+- 首次连接时固定当时的目标图纸；在 CAD 中切换标签页不会改变本会话的目标。
+- new_drawing/open_drawing 才切换目标；关闭或失去连接后须显式新建/打开，避免改动无关图纸。
+- screenshot、视图和命令工具会激活固定目标图纸。drawing://current 可查询目标文档名。
 - 绘图后建议用 screenshot 截图确认效果，用 list_entities 查询图纸实际内容
 - send_command 可直通 CAD 命令行，执行任何未封装为工具的 CAD 命令
 """
@@ -167,7 +170,7 @@ class CADService:
         self.nlp_processor = NLPProcessor()
         self.drawing_state = {
             "entities": [],
-            "current_layer": "0",
+            "current_layer": None,
             "last_command": "",
             "last_result": ""
         }
@@ -182,13 +185,19 @@ class CADService:
         """启动CAD"""
         return self.controller.start_cad()
 
+    def _current_layer(self, requested=None):
+        # The cached session record is not authoritative after UI/document changes.
+        current = requested or self.controller.get_current_layer_name()
+        self.drawing_state["current_layer"] = current
+        return current
+
     def draw_line(self, start_point, end_point, layer=None, color=None, lineweight=None):
         """绘制直线"""
         if not self.controller.is_running():
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_line(start_point, end_point, current_layer, color, lineweight)
         if result:
@@ -214,7 +223,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_circle(center, radius, current_layer, color, lineweight)
         if result:
@@ -240,7 +249,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_arc(center, radius, start_angle, end_angle, current_layer, color, lineweight)
 
@@ -269,7 +278,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_ellipse(center, major_axis, minor_axis, rotation, current_layer, color, lineweight)
 
@@ -298,7 +307,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_polyline(points, closed, current_layer, color, lineweight)
         if result:
@@ -324,7 +333,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_rectangle(corner1, corner2, current_layer, color, lineweight)
         if result:
@@ -350,7 +359,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_text(position, text, height, rotation, current_layer, color)
         if result:
@@ -377,7 +386,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.draw_hatch(points, pattern_name, scale, current_layer, color)
         if result:
@@ -403,7 +412,7 @@ class CADService:
             self.start_cad()
 
         # 使用当前图层或指定图层
-        current_layer = layer or self.drawing_state["current_layer"]
+        current_layer = self._current_layer(layer)
 
         result = self.controller.add_dimension(start_point, end_point, text_position, textheight, current_layer, color)
         if result:
@@ -639,6 +648,12 @@ async def _entities_result(entities: List[Any], ok_message: str, fail_message: s
     return ToolResult(success=True, message=ok_message, entity_handles=handles)
 
 
+def _unavailable_message() -> str:
+    if getattr(cad_service.controller, "_target_lost", False):
+        return "会话目标图纸已关闭或连接已失效；请先调用 new_drawing 或 open_drawing 重新指定目标"
+    return "CAD未运行或自动启动失败"
+
+
 async def _ensure_running(ctx: Context) -> bool:
     """确保CAD已运行：未运行时先给进度提示再自动启动（首次启动可能较慢）
 
@@ -647,6 +662,9 @@ async def _ensure_running(ctx: Context) -> bool:
     """
     if cad_service.controller.is_running():
         return True
+    if getattr(cad_service.controller, "_target_lost", False):
+        await ctx.info(_unavailable_message())
+        return False
     await ctx.info("CAD未运行，正在启动CAD（首次启动可能需要约20秒）...")
     if await com(cad_service.start_cad):
         return True
@@ -670,7 +688,7 @@ async def draw_line(ctx: Context, start_point: Point, end_point: Point,
     color 支持CAD颜色索引(1-256)或中英文颜色名称（如"红色"、"red"），不指定则保持随层颜色。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_line, start_point, end_point, layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "直线已绘制", "绘制直线失败")
 
@@ -684,7 +702,7 @@ async def draw_circle(ctx: Context, center: Point, radius: PosFloat,
     color 支持CAD颜色索引(1-256)或中英文颜色名称，不指定则保持随层颜色。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_circle, center, radius, layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "圆已绘制", "绘制圆失败")
 
@@ -696,7 +714,7 @@ async def draw_arc(ctx: Context, center: Point, radius: PosFloat,
                    lineweight: Optional[float] = None) -> ToolResult:
     """在CAD中绘制弧（角度单位：度）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_arc, center, radius, start_angle, end_angle,
                        layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "圆弧已绘制", "绘制圆弧失败")
@@ -709,7 +727,7 @@ async def draw_ellipse(ctx: Context, center: Point, major_axis: PosFloat, minor_
                        lineweight: Optional[float] = None) -> ToolResult:
     """在CAD中绘制椭圆（rotation 为旋转角度，单位：度）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_ellipse, center, major_axis, minor_axis, rotation,
                        layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "椭圆已绘制", "绘制椭圆失败")
@@ -721,7 +739,7 @@ async def draw_polyline(ctx: Context, points: Points, closed: bool = False,
                         lineweight: Optional[float] = None) -> ToolResult:
     """在CAD中绘制多段线（closed=True 时闭合）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_polyline, points, closed, layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "多段线已绘制", "绘制多段线失败")
 
@@ -732,7 +750,7 @@ async def draw_rectangle(ctx: Context, corner1: Point, corner2: Point,
                          lineweight: Optional[float] = None) -> ToolResult:
     """在CAD中绘制矩形（由两个对角点确定）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_rectangle, corner1, corner2, layer, _resolve_color(color), lineweight)
     return await _entity_result(entity, "矩形已绘制", "绘制矩形失败")
 
@@ -743,7 +761,7 @@ async def draw_text(ctx: Context, position: Point, text: str, height: PosFloat =
                     color: Union[int, str, None] = None) -> ToolResult:
     """在CAD中添加单行文本"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_text, position, text, height, rotation, layer, _resolve_color(color))
     return await _entity_result(entity, "文本已添加", "添加文本失败")
 
@@ -757,7 +775,7 @@ async def draw_hatch(ctx: Context, points: HatchPoints, pattern_name: str = "SOL
     pattern_name 为填充图案名称，默认 SOLID（实体填充）。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.draw_hatch, points, pattern_name, scale, layer, _resolve_color(color))
     return await _entity_result(entity, "填充已绘制", "绘制填充失败")
 
@@ -768,7 +786,7 @@ async def add_dimension(ctx: Context, start_point: Point, end_point: Point,
                         layer: Optional[str] = None, color: Union[int, str, None] = None) -> ToolResult:
     """在CAD中添加线性标注（text_position 不指定时自动放在中点上方）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     entity = await com(cad_service.add_dimension, start_point, end_point, text_position, textheight,
                        layer, _resolve_color(color))
     return await _entity_result(entity, "标注已添加", "添加标注失败")
@@ -780,7 +798,7 @@ async def add_dimension(ctx: Context, start_point: Point, end_point: Point,
 async def list_layers(ctx: Context) -> ListLayersResult:
     """列出当前图纸的所有图层（名称、颜色、冻结/锁定/开关状态、是否当前层）"""
     if not await _ensure_running(ctx):
-        return ListLayersResult(success=False, message="CAD未运行且自动启动失败")
+        return ListLayersResult(success=False, message=_unavailable_message())
     layers = await com(cad_service.controller.list_layers)
     return ListLayersResult(success=True, message=f"共{len(layers)}个图层", layers=layers)
 
@@ -794,7 +812,7 @@ async def list_entities(ctx: Context, entity_type: Optional[str] = None,
     entity_type 可按类型过滤（如 line/circle/arc/text）；limit 控制返回数量。
     """
     if not await _ensure_running(ctx):
-        return ListEntitiesResult(success=False, message="CAD未运行且自动启动失败")
+        return ListEntitiesResult(success=False, message=_unavailable_message())
     result = await com(cad_service.controller.list_entities, entity_type, limit)
     return ListEntitiesResult(success=True,
                               message=f"模型空间共{result['total']}个实体，返回{len(result['entities'])}个",
@@ -807,7 +825,7 @@ async def list_entities(ctx: Context, entity_type: Optional[str] = None,
 async def get_entity_properties(ctx: Context, handle: str) -> EntityPropertiesResult:
     """按句柄查询实体详细属性（几何信息随实体类型而异：坐标/半径/文本内容等）"""
     if not await _ensure_running(ctx):
-        return EntityPropertiesResult(success=False, message="CAD未运行且自动启动失败")
+        return EntityPropertiesResult(success=False, message=_unavailable_message())
     try:
         props = await com(cad_service.controller.get_entity_properties, handle)
         return EntityPropertiesResult(success=True, message="查询成功", **props)
@@ -835,7 +853,7 @@ async def screenshot(ctx: Context):
 async def erase_entity(ctx: Context, handle: str) -> ToolResult:
     """删除指定句柄的实体"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.erase_entity, handle)
     return ToolResult(success=ok, message="实体已删除" if ok else f"删除句柄 {handle} 失败")
 
@@ -844,7 +862,7 @@ async def erase_entity(ctx: Context, handle: str) -> ToolResult:
 async def move_entity(ctx: Context, handle: str, displacement: Point) -> ToolResult:
     """移动实体（displacement 为位移向量 [dx, dy, dz]）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.move_entity, handle, displacement)
     return ToolResult(success=ok, message="实体已移动" if ok else f"移动句柄 {handle} 失败")
 
@@ -853,7 +871,7 @@ async def move_entity(ctx: Context, handle: str, displacement: Point) -> ToolRes
 async def rotate_entity(ctx: Context, handle: str, base_point: Point, angle_degrees: float) -> ToolResult:
     """绕基点旋转实体（角度单位：度，逆时针为正）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.rotate_entity, handle, base_point, angle_degrees)
     return ToolResult(success=ok, message="实体已旋转" if ok else f"旋转句柄 {handle} 失败")
 
@@ -862,7 +880,7 @@ async def rotate_entity(ctx: Context, handle: str, base_point: Point, angle_degr
 async def scale_entity(ctx: Context, handle: str, base_point: Point, scale_factor: PosFloat) -> ToolResult:
     """绕基点缩放实体（scale_factor>1 放大，<1 缩小）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.scale_entity, handle, base_point, scale_factor)
     return ToolResult(success=ok, message="实体已缩放" if ok else f"缩放句柄 {handle} 失败")
 
@@ -871,7 +889,7 @@ async def scale_entity(ctx: Context, handle: str, base_point: Point, scale_facto
 async def copy_entity(ctx: Context, handle: str, displacement: Point) -> ToolResult:
     """复制实体并平移指定位移，返回新实体句柄"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     copy = await com(cad_service.controller.copy_entity, handle, displacement)
     return await _entity_result(copy, "实体已复制", f"复制句柄 {handle} 失败")
 
@@ -880,7 +898,7 @@ async def copy_entity(ctx: Context, handle: str, displacement: Point) -> ToolRes
 async def mirror_entity(ctx: Context, handle: str, point1: Point, point2: Point) -> ToolResult:
     """沿两点确定的镜像轴镜像实体（保留原实体），返回新实体句柄"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     mirrored = await com(cad_service.controller.mirror_entity, handle, point1, point2)
     return await _entity_result(mirrored, "实体已镜像", f"镜像句柄 {handle} 失败")
 
@@ -889,7 +907,7 @@ async def mirror_entity(ctx: Context, handle: str, point1: Point, point2: Point)
 async def offset_entity(ctx: Context, handle: str, distance: float) -> ToolResult:
     """偏移实体（正负值决定偏移方向），返回新实体句柄"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     entities = await com(cad_service.controller.offset_entity, handle, distance)
     return await _entities_result(entities, "实体已偏移", f"偏移句柄 {handle} 失败")
 
@@ -898,7 +916,7 @@ async def offset_entity(ctx: Context, handle: str, distance: float) -> ToolResul
 async def array_linear_entity(ctx: Context, handle: str, count: ArrayCount, displacement: Point) -> ToolResult:
     """矩形阵列：沿位移向量方向复制 count-1 份（含原实体共 count 个）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     entities = await com(cad_service.controller.array_linear_entity, handle, count, displacement)
     return await _entities_result(entities, f"已完成{count}个的线性阵列", f"阵列句柄 {handle} 失败")
 
@@ -908,27 +926,27 @@ async def array_polar_entity(ctx: Context, handle: str, count: ArrayCount, cente
                              total_angle_degrees: float = 360.0) -> ToolResult:
     """环形阵列：绕中心点在 total_angle 角度范围内复制 count-1 份"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     entities = await com(cad_service.controller.array_polar_entity, handle, count, center, total_angle_degrees)
     return await _entities_result(entities, f"已完成{count}个的环形阵列", f"阵列句柄 {handle} 失败")
 
 
 @mcp.tool()
 async def undo(ctx: Context) -> ToolResult:
-    """撤销上一步操作"""
+    """提交撤销命令，完成状态需用查询工具回读验证"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.undo)
-    return ToolResult(success=ok, message="已撤销" if ok else "撤销失败")
+    return ToolResult(success=ok, message="撤销命令已提交，需回读图纸验证结果" if ok else "撤销命令提交失败")
 
 
 @mcp.tool()
 async def redo(ctx: Context) -> ToolResult:
-    """重做被撤销的操作"""
+    """提交重做命令，完成状态需用查询工具回读验证"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.redo)
-    return ToolResult(success=ok, message="已重做" if ok else "重做失败")
+    return ToolResult(success=ok, message="重做命令已提交，需回读图纸验证结果" if ok else "重做命令提交失败")
 
 
 # ---------- 图层管理 ----------
@@ -937,7 +955,7 @@ async def redo(ctx: Context) -> ToolResult:
 async def create_layer(ctx: Context, layer_name: str) -> ToolResult:
     """创建新图层并设为当前图层（若已存在则直接激活）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.create_layer, layer_name)
     if ok:
         cad_service.drawing_state["current_layer"] = layer_name
@@ -948,7 +966,7 @@ async def create_layer(ctx: Context, layer_name: str) -> ToolResult:
 async def set_current_layer(ctx: Context, layer_name: str) -> ToolResult:
     """切换当前图层（图层必须已存在）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.set_current_layer, layer_name)
     if ok:
         cad_service.drawing_state["current_layer"] = layer_name
@@ -959,20 +977,21 @@ async def set_current_layer(ctx: Context, layer_name: str) -> ToolResult:
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def new_drawing(ctx: Context) -> ToolResult:
-    """新建图纸文档"""
-    if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+    """新建图纸文档并明确将本会话目标切换到它"""
+    if cad_service.controller.app is None and not await com(cad_service.controller.start_cad, True):
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.new_drawing)
     if ok:
         # 会话绘图记录归属于旧文档，切换文档后清空
         cad_service.drawing_state["entities"] = []
+        cad_service.drawing_state["current_layer"] = None
     return ToolResult(success=ok, message="新文档已创建" if ok else "新建文档失败")
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def open_drawing(ctx: Context, file_path: str) -> ToolResult:
     """打开已有图纸文件（DWG/DXF等）"""
-    if cad_service.controller.app is None and not await com(cad_service.controller.start_cad):
+    if cad_service.controller.app is None and not await com(cad_service.controller.start_cad, True):
         return ToolResult(success=False, message="CAD未运行且启动失败")
     try:
         ok = await com(cad_service.controller.open_drawing, file_path)
@@ -980,6 +999,7 @@ async def open_drawing(ctx: Context, file_path: str) -> ToolResult:
         return ToolResult(success=False, message=str(e))
     if ok:
         cad_service.drawing_state["entities"] = []
+        cad_service.drawing_state["current_layer"] = None
     return ToolResult(success=ok, message=f"文档已打开: {file_path}" if ok else f"打开文档失败: {file_path}")
 
 
@@ -987,18 +1007,19 @@ async def open_drawing(ctx: Context, file_path: str) -> ToolResult:
 async def close_drawing(ctx: Context, save: bool = False) -> ToolResult:
     """关闭当前文档（save=False 时不保存直接关闭）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.close_drawing, save)
     if ok:
         cad_service.drawing_state["entities"] = []
+        cad_service.drawing_state["current_layer"] = None
     return ToolResult(success=ok, message="文档已关闭" if ok else "关闭文档失败")
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def save_drawing(ctx: Context, file_path: str) -> ToolResult:
-    """保存当前图纸（按扩展名自动选择 DWG/DXF 格式；已存在的文件将被覆盖）"""
+    """保存会话目标图纸（.dwg/.dxf 选择对应的 2018 格式；已存在的文件将被覆盖）"""
     if not cad_service.controller.is_running():
-        return ToolResult(success=False, message="CAD未运行")
+        return ToolResult(success=False, message=_unavailable_message())
     await ctx.info(f"正在保存图纸到 {file_path} ...")
     try:
         ok = await com(cad_service.save_drawing, file_path)
@@ -1016,7 +1037,7 @@ async def send_command(ctx: Context, command: str) -> ToolResult:
     建议命令以 "_." 前缀强制英文命令名以兼容中文版CAD。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     ok = await com(cad_service.controller.send_command, command)
     return ToolResult(success=ok, message=f"命令已提交: {command}" if ok else "命令执行失败")
 
@@ -1030,7 +1051,7 @@ async def create_block(ctx: Context, block_name: str, base_point: Optional[Point
     注意：图块内部实体可通过 send_command 执行 BEDIT 等命令编辑。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     block = await com(cad_service.controller.create_block, block_name, base_point)
     return await _entity_result(block, f"图块 {block_name} 已就绪", f"创建图块 {block_name} 失败")
 
@@ -1041,7 +1062,7 @@ async def insert_block(ctx: Context, block_name: str, position: Point,
                        rotation_degrees: float = 0.0) -> ToolResult:
     """在模型空间插入图块引用（返回图块引用实体的句柄）"""
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message())
     block_ref = await com(cad_service.controller.insert_block, block_name, position,
                           x_scale, y_scale, z_scale, rotation_degrees)
     return await _entity_result(block_ref, f"图块 {block_name} 已插入", f"插入图块 {block_name} 失败（请确认图块已定义）")
@@ -1051,7 +1072,7 @@ async def insert_block(ctx: Context, block_name: str, position: Point,
 async def list_blocks(ctx: Context) -> ListBlocksResult:
     """列出当前图纸中的用户图块定义"""
     if not await _ensure_running(ctx):
-        return ListBlocksResult(success=False, message="CAD未运行且自动启动失败")
+        return ListBlocksResult(success=False, message=_unavailable_message())
     blocks = await com(cad_service.controller.list_blocks)
     return ListBlocksResult(success=True, message=f"共{len(blocks)}个图块", blocks=blocks)
 
@@ -1066,7 +1087,7 @@ async def process_command(ctx: Context, command: str) -> ToolResult:
     仅在用户明确要求自然语言入口时使用本工具。
     """
     if not await _ensure_running(ctx):
-        return ToolResult(success=False, message="CAD未运行且自动启动失败", error="CAD未运行且自动启动失败")
+        return ToolResult(success=False, message=_unavailable_message(), error="CAD未运行且自动启动失败")
     result = await com(cad_service.process_command, command)
     # 兼容旧返回结构（entity_id）并映射到统一结果
     handles = []
