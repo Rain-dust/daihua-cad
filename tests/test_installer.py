@@ -214,8 +214,8 @@ class InstallerTests(unittest.TestCase):
         custom = str(self.root / "custom-codex")
         with patch.dict(os.environ, {"CODEX_HOME": custom}):
             config, skills = installer.locations(args)
-        self.assertEqual(config, Path(custom) / "config.toml")
-        self.assertEqual(skills, Path.home() / ".agents/skills")
+        self.assertEqual(config, (Path(custom) / "config.toml").resolve())
+        self.assertEqual(skills, (Path.home() / ".agents/skills").resolve())
 
     def test_check_does_not_write_or_start_cad(self):
         before = self.snapshot()
