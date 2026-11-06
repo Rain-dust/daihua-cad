@@ -32,7 +32,8 @@
         "Replaced private machine paths and unavailable references with portable setup guidance.",
         "Made delivery conventions project defaults that explicit user requirements may override.",
         "Corrected drawing-unit assumptions and native radial/diametric dimension examples using Autodesk documentation.",
-        "Removed cached bytecode, private environment facts and unbundled example claims."
+        "Removed cached bytecode, private environment facts and unbundled example claims.",
+        "Added task-based routing across programmatic DXF, native CAD and MCP; split long skill entry points into references loaded only when needed."
       ]
     }
   ]

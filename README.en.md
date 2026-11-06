@@ -39,9 +39,11 @@ Installation downloads Python dependencies, creates a repository-local `.venv`, 
 | --- | --- |
 | Requirements | Consolidate task briefs, messages, delivery formats, and missing inputs |
 | Source review | Read source CAD, screenshots, and dimensions to establish scope |
-| Drafting and revisions | Choose local CAD automation or offline DXF for the task |
+| Drafting and revisions | Choose batch Python geometry, native CAD, or a mixed workflow |
 | Drawing checks | Review key geometry, layers, dimensions, and editability |
 | Delivery | Prepare agreed DWG / PDF files and report what was verified |
+
+For simple 2D geometry and image reconstruction with reliable dimensions, the skills first consider installed Python/ezdxf tools. Existing DWG revisions, special objects, native plotting, and format conversion use suitable CAD APIs, scripts, or MCP when needed. Accuracy, preservation of the source drawing, and the agreed formats take priority; AutoCAD startup and per-entity MCP calls are not default steps. Detailed skill references are loaded only for the chosen task.
 
 Actual capabilities depend on the agent client, available CAD software, and source material. Review deliverables against the project requirements before sending them to a client.
 

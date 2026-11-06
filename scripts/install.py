@@ -450,7 +450,7 @@ def main(argv=None):
             prune_empty(path.parent, skills)
         if args.skip_deps:
             print("Dependencies skipped: this configuration will work only after .venv and requirements-runtime.txt are installed.")
-        print("Daihua CAD configured. Restart or reload your agent client, then ask it to connect to your local CAD application.")
+        print("Daihua CAD configured. Restart or reload your agent client, then give it a drawing task. The skills choose programmatic DXF or CAD tools as needed.")
         return 0
     except (InstallError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
