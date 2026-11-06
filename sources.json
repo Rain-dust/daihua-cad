@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "project": "daihua-cad",
+  "integration_maintainer": "Rain-dust",
+  "integration_date": "2026-11-06",
+  "repositories": [
+    {
+      "name": "CAD-MCP",
+      "url": "https://github.com/daobataotie/CAD-MCP",
+      "commit": "ef26482579424bb564b8b2ccc24f29f133f66fbf",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2025 曹瑞",
+      "license_file": "licenses/cad-mcp-MIT.txt",
+      "distribution_path": "vendor/cad-mcp",
+      "modifications": [
+        "Integrated the existing locally adapted CAD MCP source; see repository history for compatibility changes."
+      ]
+    },
+    {
+      "name": "cad-skills",
+      "url": "https://github.com/delancy827/cad-skills",
+      "commit": "6051169eb3cd39a6539d823261b8519f718828ed",
+      "license": "MIT",
+      "copyright": "Copyright (c) 2026 Delancy",
+      "license_file": "licenses/cad-skills-MIT.txt",
+      "distribution_paths": [
+        "skills/cad-automation",
+        "skills/cad-designer"
+      ],
+      "modifications": [
+        "Preserved CAD guidance and editable-DXF audit helper from the installed skills.",
+        "Replaced private machine paths and unavailable references with portable setup guidance.",
+        "Made delivery conventions project defaults that explicit user requirements may override.",
+        "Corrected drawing-unit assumptions and native radial/diametric dimension examples using Autodesk documentation.",
+        "Removed cached bytecode, private environment facts and unbundled example claims."
+      ]
+    }
+  ]
+}

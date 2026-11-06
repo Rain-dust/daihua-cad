@@ -1,0 +1,17 @@
+.venv/
+.daihua/
+.cache/
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+output/
+*.bak
+*.dwl
+*.dwl2
+.env
+.env.*
+!.env.example
+*.egg-info/
+build/
+dist/
