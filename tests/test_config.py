@@ -16,7 +16,7 @@ class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.file = self.root / "config.json"
         self.addCleanup(patch.stopall)
         patch.object(config, "_CONFIG_PATH", self.file).start()

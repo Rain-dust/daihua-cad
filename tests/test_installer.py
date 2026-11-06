@@ -22,7 +22,7 @@ class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="daihua cad test ")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repository with spaces 中文 🦁"
         (self.repo / "vendor/cad-mcp/src").mkdir(parents=True)
         (self.repo / "vendor/cad-mcp/src/server.py").write_text("# test server\n", encoding="utf-8")
