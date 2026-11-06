@@ -9,3 +9,9 @@
 - PowerShell 5.1 的实际 `-DryRun` 通过，包含带空格、中文和特殊字符的路径。
 
 这些检查验证首版的安装、协议和连接路径。未逐项测试全部 MCP 绘图命令；中望、浩辰及 AutoCAD LT 尚未在本项目实测。GitHub Actions 配置额外覆盖 Windows/Linux 与 Python 3.11/3.12；运行结果以 Actions 页面为准。
+
+## v0.1.2 补充验证
+
+- 修正 Windows 短路径与完整路径的测试比较；MCP 验证控制台输出采用 ASCII JSON，UTF-8 报告文件保留中文。
+- 直接 Python 安装入口对宿主编码无法表示的字符作转义容错；新增 cp1252 子进程回归，验证中文和 emoji 路径的 dry-run 不写入文件。
+- 本地测试增至 25 项并全部通过；Windows/Linux 与 Python 3.11/3.12 的自动检查见 GitHub Actions。

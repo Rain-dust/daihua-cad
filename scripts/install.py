@@ -383,4 +383,10 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    # Agent hosts may pipe output through a legacy Windows encoding. Keep
+    # diagnostic paths printable without changing streams when imported.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
     raise SystemExit(main())

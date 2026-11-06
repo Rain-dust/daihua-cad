@@ -5,6 +5,8 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import tomllib
@@ -260,6 +262,30 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("symbolic link", output)
         self.assertEqual(self.run_cli("--uninstall")[0], 0)
         self.assertEqual(protected.read_text(encoding="utf-8"), "original guide\n")
+
+
+    def test_cli_cp1252_dry_run_handles_unicode_without_writes(self):
+        script = self.repo / "scripts/install.py"
+        script.parent.mkdir()
+        script.write_bytes(Path(installer.__file__).read_bytes())
+        config = self.root / "输出配置 🦁" / "mcp.json"
+        before = self.snapshot()
+        result = subprocess.run(
+            [sys.executable, str(script), "--client", "generic", "--config", str(config), "--dry-run"],
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+            capture_output=True,
+            text=True,
+            encoding="cp1252",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Dry run:", result.stdout)
+        self.assertIn(r"\u8f93", result.stdout)
+        self.assertNotIn("UnicodeEncodeError", result.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(config.parent.exists())
+        self.assertFalse((self.repo / ".daihua").exists())
+        self.assertFalse((self.repo / ".venv").exists())
 
 
 if __name__ == "__main__":
