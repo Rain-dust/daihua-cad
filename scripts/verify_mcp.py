@@ -47,7 +47,7 @@ async def verify(args):
                     report["cad_connected"] = True
                     report["layer_count"] = len(data.get("layers", []))
     (output / "mcp-verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False))
+    print(json.dumps(report, ensure_ascii=True))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
